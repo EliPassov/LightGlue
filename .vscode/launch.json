@@ -1,0 +1,41 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "VIS-NIR SuperPoint+LightGlue: country limit 20",
+      "type": "python",
+      "request": "launch",
+      "program": "${workspaceFolder}/experiments/vis_nir_superpoint_lightglue.py",
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "args": [
+        "--data_root",
+        "/media/eli/storage2/Datasets/visnir_raw",
+        "--category",
+        "country",
+        "--limit",
+        "20",
+        "--output_csv",
+        "outputs/vis_nir_country_sp_lightglue_limit20.csv"
+      ]
+    },
+    {
+      "name": "VIS-NIR SuperPoint+LightGlue: smoke test",
+      "type": "python",
+      "request": "launch",
+      "program": "${workspaceFolder}/experiments/vis_nir_superpoint_lightglue.py",
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "args": [
+        "--data_root",
+        "/media/eli/storage2/Datasets/visnir_raw",
+        "--category",
+        "country",
+        "--limit",
+        "3",
+        "--output_csv",
+        "outputs/debug_vis_nir_country_sp_lightglue.csv"
+      ]
+    }
+  ]
+}
