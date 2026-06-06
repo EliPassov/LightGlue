@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import argparse
 import csv
-import math
 import os
 import sys
 from pathlib import Path
@@ -24,8 +23,15 @@ if str(ROOT) not in sys.path:
 os.environ.setdefault("TORCH_HOME", str(ROOT / ".cache" / "torch"))
 
 from lightglue import LightGlue, SuperPoint  # noqa: E402
-from lightglue.utils import load_image as lg_load_image  # noqa: E402
 from lightglue.utils import rbd  # noqa: E402
+from vis_nir_common import (  # noqa: E402
+    discover_pairs,
+    extract_superpoint_features,
+    mean_or_nan,
+    median_or_nan,
+    parse_thresholds,
+    print_pairs,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -36,99 +42,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rgb_suffix", default="_rgb.tiff")
     parser.add_argument("--nir_suffix", default="_nir.tiff")
     parser.add_argument("--max_num_keypoints", type=int, default=2048)
+    parser.add_argument("--nms_radius", type=int, default=4, help="SuperPoint NMS radius in pixels.")
     parser.add_argument("--resize", type=int, default=None, help="Optional resize value passed to extractor.extract; default disables resizing.")
     parser.add_argument("--thresholds", default="1,3,5,10")
     parser.add_argument("--output_csv", default="outputs/vis_nir_superpoint_lightglue.csv", help="Path to write per-pair CSV results.")
     parser.add_argument("--device", default=None, help="Device to use. Defaults to cuda when available, otherwise cpu.")
     parser.add_argument("--limit", type=int, default=None)
+    parser.add_argument("--limit_per_category", type=int, default=None, help="When scanning all categories, keep this many pairs per first-level category.")
+    parser.add_argument("--exclude_categories", default=None, help="Comma-separated category names to skip, e.g. country.")
+    parser.add_argument("--filter_border", type=int, default=0, help="Drop keypoints within this many pixels of the image border before matching.")
     return parser.parse_args()
-
-
-def selected_root(data_root: str, category: str | None) -> Path:
-    root = Path(data_root)
-    return root / category if category else root
-
-
-def discover_pairs(args: argparse.Namespace) -> list[tuple[Path, Path]]:
-    if args.pairs_file:
-        pairs_path = Path(args.pairs_file)
-        base = pairs_path.parent
-        pairs = []
-        with pairs_path.open("r", encoding="utf-8") as f:
-            for line_no, line in enumerate(f, 1):
-                line = line.strip()
-                if not line or line.startswith("#"):
-                    continue
-                parts = line.split()
-                if len(parts) != 2:
-                    raise ValueError(
-                        f"{pairs_path}:{line_no} must contain: rgb_path nir_path"
-                    )
-                rgb, nir = (Path(parts[0]), Path(parts[1]))
-                pairs.append(
-                    (
-                        rgb if rgb.is_absolute() else base / rgb,
-                        nir if nir.is_absolute() else base / nir,
-                    )
-                )
-    else:
-        root = selected_root(args.data_root, args.category)
-        if not root.exists():
-            raise FileNotFoundError(f"Selected data directory does not exist: {root}")
-
-        pairs = []
-        for rgb_path in sorted(root.rglob(f"*{args.rgb_suffix}")):
-            stem = rgb_path.name[: -len(args.rgb_suffix)]
-            nir_path = rgb_path.with_name(f"{stem}{args.nir_suffix}")
-            if nir_path.exists():
-                pairs.append((rgb_path, nir_path))
-
-    if args.limit is not None:
-        pairs = pairs[: args.limit]
-    return pairs
-
-
-def pil_load_image(path: Path) -> torch.Tensor:
-    from PIL import Image
-
-    image = np.asarray(Image.open(path))
-    if image.ndim == 2:
-        image = np.repeat(image[..., None], 3, axis=2)
-    elif image.ndim == 3 and image.shape[2] > 3:
-        image = image[..., :3]
-    if image.dtype == np.uint8:
-        image = image.astype(np.float32) / 255.0
-    else:
-        image = image.astype(np.float32)
-        max_value = float(np.nanmax(image)) if image.size else 0.0
-        image = image / max_value if max_value > 0 else image
-    image = np.clip(image, 0.0, 1.0)
-    return torch.from_numpy(image.transpose(2, 0, 1)).float()
-
-
-def load_visnir_image(path: Path, device: torch.device) -> torch.Tensor:
-    try:
-        image = lg_load_image(path)
-    except Exception:
-        image = pil_load_image(path)
-    return image.to(device)
-
-
-def parse_thresholds(thresholds: str) -> list[float]:
-    values = [float(t.strip()) for t in thresholds.split(",") if t.strip()]
-    if not values:
-        raise ValueError("--thresholds must contain at least one numeric value")
-    return values
-
-
-def mean_or_nan(values: list[float]) -> float:
-    values = [v for v in values if not math.isnan(v)]
-    return float(np.mean(values)) if values else float("nan")
-
-
-def median_or_nan(values: list[float]) -> float:
-    values = [v for v in values if not math.isnan(v)]
-    return float(np.median(values)) if values else float("nan")
 
 
 def evaluate_pair(
@@ -139,13 +62,11 @@ def evaluate_pair(
     device: torch.device,
     resize: int | None,
     thresholds: list[float],
+    filter_border: int,
 ) -> dict[str, object]:
-    image0 = load_visnir_image(rgb_path, device)
-    image1 = load_visnir_image(nir_path, device)
-
     with torch.inference_mode():
-        feats0 = extractor.extract(image0, resize=resize)
-        feats1 = extractor.extract(image1, resize=resize)
+        feats0, raw_num_keypoints_rgb = extract_superpoint_features(rgb_path, extractor, device, resize, filter_border)
+        feats1, raw_num_keypoints_nir = extract_superpoint_features(nir_path, extractor, device, resize, filter_border)
         matches01 = matcher({"image0": feats0, "image1": feats1})
 
     feats0, feats1, matches01 = [rbd(x) for x in [feats0, feats1, matches01]]
@@ -155,8 +76,11 @@ def evaluate_pair(
     num_keypoints_nir = int(feats1["keypoints"].shape[0])
 
     row: dict[str, object] = {
+        "category": rgb_path.parent.name,
         "rgb_path": str(rgb_path),
         "nir_path": str(nir_path),
+        "num_superpoint_keypoints_rgb": raw_num_keypoints_rgb,
+        "num_superpoint_keypoints_nir": raw_num_keypoints_nir,
         "num_keypoints_rgb": num_keypoints_rgb,
         "num_keypoints_nir": num_keypoints_nir,
         "num_matches": num_matches,
@@ -182,19 +106,14 @@ def evaluate_pair(
     row["median_pixel_error"] = median_error
     row["mean_pixel_error"] = mean_error
     return row
-
-
-def print_pairs(pairs: list[tuple[Path, Path]]) -> None:
-    print(f"Found {len(pairs)} RGB/NIR pairs")
-    for rgb, nir in pairs[:5]:
-        print(f"  {rgb}  {nir}")
-
-
 def print_aggregate(rows: list[dict[str, object]], thresholds: list[float]) -> None:
     print("\nAggregate results")
     print(f"total_pairs: {len(rows)}")
     print(f"average_rgb_keypoints: {mean_or_nan([float(r['num_keypoints_rgb']) for r in rows]):.3f}")
     print(f"average_nir_keypoints: {mean_or_nan([float(r['num_keypoints_nir']) for r in rows]):.3f}")
+    if "num_superpoint_keypoints_rgb" in rows[0]:
+        print(f"average_raw_superpoint_rgb_keypoints: {mean_or_nan([float(r['num_superpoint_keypoints_rgb']) for r in rows]):.3f}")
+        print(f"average_raw_superpoint_nir_keypoints: {mean_or_nan([float(r['num_superpoint_keypoints_nir']) for r in rows]):.3f}")
     print(f"average_matches: {mean_or_nan([float(r['num_matches']) for r in rows]):.3f}")
     for threshold in thresholds:
         suffix = f"{threshold:g}"
@@ -215,26 +134,18 @@ def main() -> None:
     print_pairs(pairs)
     print(f"Selected device: {device}")
     print(f"Resize: {args.resize}")
+    print(f"Filter border: {args.filter_border}")
+    print(f"SuperPoint NMS radius: {args.nms_radius}")
     if not pairs:
         raise RuntimeError("No RGB/NIR pairs found.")
 
-    extractor = SuperPoint(max_num_keypoints=args.max_num_keypoints).eval().to(device)
+    extractor = SuperPoint(max_num_keypoints=args.max_num_keypoints, nms_radius=args.nms_radius).eval().to(device)
     matcher = LightGlue(features="superpoint").eval().to(device)
 
     rows = []
     for i, (rgb_path, nir_path) in enumerate(pairs, 1):
         print(f"[{i}/{len(pairs)}] {rgb_path.name} <-> {nir_path.name}")
-        rows.append(
-            evaluate_pair(
-                rgb_path,
-                nir_path,
-                extractor,
-                matcher,
-                device,
-                args.resize,
-                thresholds,
-            )
-        )
+        rows.append(evaluate_pair(rgb_path, nir_path, extractor, matcher, device, args.resize, thresholds, args.filter_border))
 
     output_csv = Path(args.output_csv)
     output_csv.parent.mkdir(parents=True, exist_ok=True)
